@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tic-Tac-Toe en ligne</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@500;700&display=swap');
+  body { font-family: 'Space Grotesk', sans-serif; background:#020617; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  @keyframes popIn { 0% { transform: scale(0.3); opacity: 0; } 60% { transform: scale(1.12); opacity: 1; } 100% { transform: scale(1); } }
+  @keyframes fadeUp { 0% { opacity: 0; transform: translateY(10px); } 100% { opacity: 1; transform: translateY(0); } }
+  @keyframes softGlow { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .pop-in { animation: popIn 0.28s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+  .fade-up { animation: fadeUp 0.35s ease both; }
+  .soft-glow { animation: softGlow 2s ease-in-out infinite; }
+</style>
+</head>
+<body class="min-h-screen w-full text-slate-100 relative overflow-hidden flex items-center justify-center p-6">
+
+  <svg class="absolute inset-0 w-full h-full opacity-[0.07] pointer-events-none">
+    <line x1="33%" y1="-5%" x2="33%" y2="105%" stroke="white" stroke-width="2" />
+    <line x1="66%" y1="-5%" x2="66%" y2="105%" stroke="white" stroke-width="2" />
+    <line x1="-5%" y1="33%" x2="105%" y2="33%" stroke="white" stroke-width="2" />
+    <line x1="-5%" y1="66%" x2="105%" y2="66%" stroke="white" stroke-width="2" />
+  </svg>
+  <div class="absolute top-1/4 -left-24 w-72 h-72 bg-cyan-500 rounded-full blur-3xl opacity-10 pointer-events-none"></div>
+  <div class="absolute bottom-1/4 -right-24 w-72 h-72 bg-fuchsia-500 rounded-full blur-3xl opacity-10 pointer-events-none"></div>
+
+  <div id="app" class="relative w-full max-w-md"></div>
+
+<script>
+const API = "api.php";
+
+let state = {
+  view: "home", roomId: null, symbol: null, room: null,
+  joinCode: "", error: "", copied: false, busy: false,
+};
+
+let pollTimer = null;
+let lastRenderedView = null; // pour ne relancer l'animation d'entrée que sur un vrai changement de vue
+
+function saveSession() {
+  if (state.roomId && state.symbol) {
+    localStorage.setItem("ttt_session", JSON.stringify({ roomId: state.roomId, symbol: state.symbol }));
+  }
+}
+function loadSession() {
+  try { return JSON.parse(localStorage.getItem("ttt_session")); } catch (e) { return null; }
+}
+function clearSession() { localStorage.removeItem("ttt_session"); }
+
+async function api(action, params = {}) {
+  const body = new URLSearchParams({ action, ...params });
+  const res = await fetch(API, { method: "POST", body });
+  if (!res.ok) throw new Error("network");
+  return res.json();
+}
+
+async function createRoom() {
+  if (state.busy) return; // évite les doubles clics
+  state.busy = true; state.error = ""; render();
+  try {
+    const data = await api("create");
+    if (!data.ok) { state.error = data.error || "Erreur serveur."; state.busy = false; render(); return; }
+    state.roomId = data.room.id;
+    state.symbol = "X";
+    state.room = data.room;
+    state.view = "lobby";
+    saveSession();
+    history.pushState(null, "", `?room=${data.room.id}`);
+  } catch (e) {
+    state.error = "Impossible de contacter le serveur.";
+  }
+  state.busy = false; render(); startPolling();
+}
+
+async function joinRoom(id) {
+  if (!id || state.busy) return;
+  state.busy = true; state.error = ""; render();
+  try {
+    const data = await api("join", { id });
+    if (!data.ok) { state.error = data.error || "Salon introuvable."; state.busy = false; render(); return; }
+    state.roomId = data.room.id;
+    state.symbol = data.symbol;
+    state.room = data.room;
+    state.view = data.room.status === "playing" ? "game" : "lobby";
+    saveSession();
+    history.pushState(null, "", `?room=${data.room.id}`);
+  } catch (e) {
+    state.error = "Impossible de contacter le serveur.";
+  }
+  state.busy = false; render(); startPolling();
+}
+
+async function pollState() {
+  if (!state.roomId) return;
+  try {
+    const data = await api("state", { id: state.roomId });
+    if (!data.ok) return;
+
+    const prevSnapshot = JSON.stringify(state.room);
+    const nextSnapshot = JSON.stringify(data.room);
+    const shouldSwitchToGame = state.view === "lobby" && data.room.status === "playing";
+
+    // On ne re-rend QUE si quelque chose a réellement changé.
+    // C'est ça qui empêche l'écran de clignoter à chaque poll (1x/seconde).
+    if (prevSnapshot !== nextSnapshot || shouldSwitchToGame) {
+      state.room = data.room;
+      if (shouldSwitchToGame) state.view = "game";
+      render();
+    }
+  } catch (e) { /* erreur réseau ponctuelle, on réessaiera au prochain tick */ }
+}
+
+function startPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(pollState, 1000);
+}
+
+async function makeMove(i) {
+  const r = state.room;
+  if (!r || r.status !== "playing" || r.turn !== state.symbol || r.board[i] !== "-") return;
+  // Verrouillage optimiste local pour éviter le multi-clic pendant l'aller-retour réseau
+  r.board[i] = state.symbol;
+  render();
+  try {
+    const data = await api("move", { id: state.roomId, index: i, symbol: state.symbol });
+    if (data.ok) { state.room = data.room; render(); }
+  } catch (e) {}
+}
+
+async function rematch() {
+  try {
+    const data = await api("rematch", { id: state.roomId });
+    if (data.ok) { state.room = data.room; render(); }
+  } catch (e) {}
+}
+
+function leaveRoom() {
+  clearInterval(pollTimer);
+  clearSession();
+  state = { view: "home", roomId: null, symbol: null, room: null, joinCode: "", error: "", copied: false, busy: false };
+  lastRenderedView = null;
+  history.pushState(null, "", location.pathname);
+  render();
+}
+
+async function copyLink() {
+  const link = `${location.origin}${location.pathname}?room=${state.roomId}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    state.copied = true; render();
+    setTimeout(() => { state.copied = false; render(); }, 2000);
+  } catch (e) {
+    prompt("Copie ce lien :", link);
+  }
+}
+
+function render() {
+  const app = document.getElementById("app");
+  const isNewView = lastRenderedView !== state.view;
+  lastRenderedView = state.view;
+
+  let html;
+  if (state.view === "home") html = renderHome();
+  else if (state.view === "lobby") html = renderLobby();
+  else if (state.view === "game") html = renderGame();
+
+  // On ne joue l'animation d'entrée "fade-up" que lors d'un vrai changement de vue,
+  // pas à chaque rafraîchissement de données pendant le polling.
+  if (!isNewView) html = html.replace(/\bfade-up\b/g, "");
+
+  app.innerHTML = html;
+  bindEvents();
+}
+
+function renderHome() {
+  return `
+  <div class="fade-up text-center">
+    <h1 class="text-5xl sm:text-6xl font-bold tracking-tight mb-2">
+      <span class="text-cyan-400">TIC</span><span class="text-slate-100">TAC</span><span class="text-fuchsia-400">TOE</span>
+    </h1>
+    <p class="text-slate-400 mb-10 text-sm">Défie un ami en temps réel, où qu'il soit.</p>
+    <button id="btn-create" ${state.busy ? "disabled" : ""}
+      class="w-full py-4 rounded-2xl bg-cyan-400 text-slate-950 font-bold text-lg tracking-tight hover:bg-cyan-300 active:scale-[0.98] transition disabled:opacity-60 shadow-lg shadow-cyan-500/20">
+      ${state.busy ? "Création..." : "Créer une partie en ligne"}
+    </button>
+    <div class="flex items-center gap-3 my-8">
+      <div class="h-px bg-slate-800 flex-1"></div>
+      <span class="text-slate-500 text-xs uppercase tracking-widest">ou</span>
+      <div class="h-px bg-slate-800 flex-1"></div>
+    </div>
+    <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 text-left">
+      <p class="text-slate-300 text-sm font-medium mb-3">Rejoindre avec un code</p>
+      <div class="flex gap-2">
+        <input id="input-code" value="${state.joinCode}" maxlength="5" placeholder="EX: 7K3PQ"
+          class="mono flex-1 bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-slate-100 tracking-[0.2em] placeholder-slate-600 focus:outline-none focus:border-fuchsia-400 transition uppercase" />
+        <button id="btn-join" ${state.busy || state.joinCode.length < 4 ? "disabled" : ""}
+          class="px-5 rounded-xl bg-slate-100 text-slate-950 font-semibold hover:bg-white transition disabled:opacity-40 disabled:cursor-not-allowed">OK</button>
+      </div>
+    </div>
+    ${state.error ? `<p class="text-rose-400 text-sm mt-4">${state.error}</p>` : ""}
+  </div>`;
+}
+
+function renderLobby() {
+  return `
+  <div class="fade-up bg-slate-900/60 border border-slate-800 rounded-3xl p-8 text-center">
+    <div class="mx-auto w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center mb-5 text-cyan-400 text-2xl">👥</div>
+    <h2 class="text-xl font-bold mb-1">En attente du joueur 2</h2>
+    <p class="text-slate-400 text-sm mb-6">Partage le lien ou le code ci-dessous</p>
+    <div class="bg-slate-950 border border-slate-800 rounded-2xl py-4 mb-4">
+      <p class="text-slate-500 text-xs uppercase tracking-widest mb-1">Code du salon</p>
+      <p class="mono text-3xl font-bold tracking-[0.3em] text-cyan-400">${state.roomId}</p>
+    </div>
+    <button id="btn-copy" class="w-full py-3 rounded-xl bg-slate-100 text-slate-950 font-semibold hover:bg-white transition mb-3">
+      ${state.copied ? "Lien copié !" : "Copier le lien d'invitation"}
+    </button>
+    <button id="btn-leave" class="w-full py-3 rounded-xl text-slate-400 hover:text-slate-200 text-sm transition">Annuler</button>
+  </div>`;
+}
+
+function renderGame() {
+  const room = state.room;
+  const symbol = state.symbol;
+  const opponent = symbol === "X" ? "O" : "X";
+  const isMyTurn = room.status === "playing" && room.turn === symbol;
+  const finished = room.status === "finished";
+  const iWon = finished && room.winner === symbol;
+  const iLost = finished && room.winner === opponent;
+  const isDraw = finished && room.winner === "draw";
+  const colorFor = s => s === "X" ? "text-cyan-400" : "text-fuchsia-400";
+
+  const cells = room.board.map((cell, i) => {
+    const c = cell === "-" ? null : cell;
+    const isWinningCell = room.win_line && room.win_line.split(",").map(Number).includes(i);
+    const clickable = !c && isMyTurn;
+    return `
+      <button data-i="${i}" ${clickable ? "" : "disabled"}
+        class="cell aspect-square rounded-2xl border flex items-center justify-center text-4xl sm:text-5xl font-bold transition-all
+          ${isWinningCell ? "border-cyan-400 bg-slate-800/80 shadow-lg shadow-cyan-500/20" : "border-slate-800 bg-slate-900/60"}
+          ${clickable ? "hover:border-slate-600 hover:bg-slate-800/60 cursor-pointer" : "cursor-default"}">
+        ${c ? `<span class="pop-in ${colorFor(c)}">${c}</span>` : ""}
+      </button>`;
+  }).join("");
+
+  return `
+  <div class="fade-up relative">
+    <div class="flex items-center justify-between mb-6 bg-slate-900/60 border border-slate-800 rounded-2xl px-4 py-3">
+      ${playerBadge("Toi", symbol, room.status === "playing" && room.turn === symbol, "left")}
+      <div class="mono text-slate-500 text-xs uppercase tracking-widest">VS</div>
+      ${playerBadge("Adversaire", opponent, room.status === "playing" && room.turn === opponent, "right")}
+    </div>
+    <p class="text-center text-sm text-slate-400 mb-4 h-5">
+      ${room.status === "playing" ? (isMyTurn ? `<span class="text-slate-100 font-medium">À toi de jouer</span>` : `<span>Tour de l'adversaire...</span>`) : ""}
+    </p>
+    <div class="grid grid-cols-3 gap-3 relative">${cells}</div>
+    <button id="btn-leave" class="w-full mt-6 py-2 rounded-xl text-slate-500 hover:text-slate-300 text-xs transition">Quitter la partie</button>
+    ${finished ? `
+    <div class="absolute inset-0 -m-2 flex items-center justify-center fade-up">
+      <div class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm rounded-3xl"></div>
+      <div class="relative bg-slate-900 border border-slate-700 rounded-3xl p-8 text-center w-full shadow-2xl">
+        <p class="text-3xl font-bold mb-2 ${iWon ? "text-cyan-400" : iLost ? "text-fuchsia-400" : "text-slate-200"}">
+          ${iWon ? "Tu as gagné 🎉" : iLost ? "Tu as perdu" : isDraw ? "Égalité !" : ""}
+        </p>
+        <p class="text-slate-400 text-sm mb-6">
+          ${iWon ? "Bien joué, la victoire est à toi." : iLost ? "Ce sera pour la prochaine fois." : "Personne ne cède, belle partie."}
+        </p>
+        <button id="btn-rematch" class="w-full py-3 rounded-xl bg-slate-100 text-slate-950 font-semibold hover:bg-white transition mb-3">Rejouer</button>
+        <button id="btn-leave-2" class="w-full py-2 rounded-xl text-slate-400 hover:text-slate-200 text-sm transition">Quitter</button>
+      </div>
+    </div>` : ""}
+  </div>`;
+}
+
+function playerBadge(label, symbol, active, align) {
+  const color = symbol === "X" ? "text-cyan-400 border-cyan-400" : "text-fuchsia-400 border-fuchsia-400";
+  return `
+    <div class="flex items-center gap-2 ${align === "right" ? "flex-row-reverse text-right" : ""}">
+      <div class="w-9 h-9 rounded-xl border-2 flex items-center justify-center font-bold ${color} ${active ? "soft-glow" : "opacity-50"}">${symbol}</div>
+      <span class="text-xs ${active ? "text-slate-200" : "text-slate-500"}">${label}</span>
+    </div>`;
+}
+
+function bindEvents() {
+  const create = document.getElementById("btn-create");
+  if (create) create.onclick = createRoom;
+  const joinBtn = document.getElementById("btn-join");
+  if (joinBtn) joinBtn.onclick = () => joinRoom(state.joinCode);
+  const input = document.getElementById("input-code");
+  if (input) {
+    input.oninput = (e) => { state.joinCode = e.target.value.toUpperCase().slice(0, 5); render(); };
+    input.focus();
+    input.setSelectionRange(state.joinCode.length, state.joinCode.length);
+  }
+  const copy = document.getElementById("btn-copy");
+  if (copy) copy.onclick = copyLink;
+  document.querySelectorAll("#btn-leave, #btn-leave-2").forEach(b => b.onclick = leaveRoom);
+  const rematchBtn = document.getElementById("btn-rematch");
+  if (rematchBtn) rematchBtn.onclick = rematch;
+  document.querySelectorAll(".cell").forEach(b => { b.onclick = () => makeMove(parseInt(b.dataset.i, 10)); });
+}
+
+(function init() {
+  const params = new URLSearchParams(location.search);
+  const urlRoom = params.get("room");
+  const session = loadSession();
+
+  if (urlRoom) {
+    if (session && session.roomId === urlRoom.toUpperCase()) {
+      state.roomId = session.roomId;
+      state.symbol = session.symbol;
+      state.view = "lobby";
+      render();
+      startPolling();
+    } else {
+      joinRoom(urlRoom.toUpperCase());
+    }
+  } else if (session && session.roomId) {
+    state.roomId = session.roomId;
+    state.symbol = session.symbol;
+    state.view = "lobby";
+    history.replaceState(null, "", `?room=${session.roomId}`);
+    render();
+    startPolling();
+  } else {
+    render();
+  }
+})();
+</script>
+</body>
+</html>
